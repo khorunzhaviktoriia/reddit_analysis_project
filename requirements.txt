@@ -2,3 +2,9 @@ pandas
 matplotlib
 jupyter
 pyarrow
+nltk
+transformers
+torch
+scikit-learn
+sentencepiece
+protobuf
