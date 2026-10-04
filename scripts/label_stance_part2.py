@@ -7,6 +7,16 @@ Run from the project root, with the virtual environment of the project:
 
     .venv\\Scripts\\python.exe scripts\\label_stance_part2.py
 
+On a computer that has only the repository, create the virtual environment first (one time):
+
+    python -m venv .venv
+    .venv\\Scripts\\python.exe -m pip install -r requirements.txt
+
+The script then downloads what is missing: llama.cpp (0.65 GB, into `.venv/llama.cpp/`) and the model
+(2.7 GB, into `data/models/`). The comments of the part must be in `data/stance/sample_part<PART>.parquet`;
+this file is drawn from `data/cleaned/comments_clean.parquet` when that table is on the computer, and is
+copied from the other computer when it is not.
+
 The run can be stopped (Ctrl+C) and started again at any time: the answers are saved every
 SAVE_EVERY comments and the comments that already have an answer are skipped.
 
@@ -28,6 +38,7 @@ import socket
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +76,9 @@ EXPECTED_SAMPLE_SHA256 = "b853d6183a4bf4ff0f4520e8eb260b5e9ccb6e2cfa94dff0e96751
 # ---------------------------------------------------------------------------------------------------------------------
 LLAMA_BUILD = "b11146"            # llama.cpp release (CUDA 12.4 build for Windows); Qwen3.5 needs b8121 or newer
 LLAMA_SERVER = Path(sys.prefix) / "llama.cpp" / LLAMA_BUILD / "llama-server.exe"      # kept inside the virtual environment
+# the two archives of the release: the server, and the CUDA runtime it needs
+LLAMA_RELEASE_URL = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_BUILD}/"
+LLAMA_ARCHIVES = [f"llama-{LLAMA_BUILD}-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]
 MODEL_NAME = "qwen4b"
 MODEL_REPO, MODEL_FILE = "unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q4_K_M.gguf"
 
@@ -219,6 +233,9 @@ def sample_sha256(ids):
 def load_sample():
     """The comments of this part, in the order of labelling. The sample is drawn once and saved, one file for each part."""
     if not SAMPLE_PATH.exists():
+        if not COMMENTS_PATH.exists():
+            raise SystemExit(f"The comments of part {PART} were not found. Copy {SAMPLE_PATH.name} from the other computer "
+                             f"into {OUT_DIR} (the sample can be drawn here only when {COMMENTS_PATH} exists).")
         whole = draw_sample()
         digest = sample_sha256(whole["id"])
         print(f"sample sha256: {digest}")
@@ -286,6 +303,52 @@ def label_probabilities(choice):
         first = {}
     total = sum(first.get(label, 0.0) for label in LABELS)
     return {f"p_{label}": first.get(label, 0.0) / total if total else np.nan for label in LABELS}
+
+
+def download(url, path):
+    """Download a file. It gets its final name only when it is complete, so a broken download is not taken for a finished one."""
+    part = path.with_name(path.name + ".part")
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        total, done = int(response.headers.get("content-length", 0)), 0
+        with open(part, "wb") as f:
+            for chunk in response.iter_content(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                print(f"\r  {path.name}: {done / 2**20:,.0f} of {total / 2**20:,.0f} MiB", end="", flush=True)
+    print()
+    if total and done != total:
+        raise SystemExit(f"The download of {url} is incomplete ({done} of {total} bytes). Start the script again.")
+    part.replace(path)
+
+
+def ensure_llama_server():
+    """llama-server with its CUDA runtime, inside the virtual environment. Downloaded from the llama.cpp release when missing."""
+    if LLAMA_SERVER.exists():
+        return
+    folder = LLAMA_SERVER.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    print(f"llama.cpp {LLAMA_BUILD} was not found; downloading it into {folder}")
+    for name in LLAMA_ARCHIVES:
+        archive = folder / name
+        if not archive.exists():
+            download(LLAMA_RELEASE_URL + name, archive)
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(folder)
+        archive.unlink()
+    if not LLAMA_SERVER.exists():
+        raise SystemExit(f"{LLAMA_SERVER.name} is not in the downloaded archives; see {folder}")
+
+
+def ensure_model():
+    """The model file. Downloaded from Hugging Face when missing."""
+    path = MODEL_DIR / MODEL_FILE
+    if not path.exists():
+        from huggingface_hub import hf_hub_download
+        print(f"{MODEL_FILE} was not found; downloading it (2.7 GB) from {MODEL_REPO} into {MODEL_DIR}")
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        hf_hub_download(MODEL_REPO, MODEL_FILE, local_dir=MODEL_DIR)
+    return path
 
 
 class LlamaServer:
@@ -458,13 +521,8 @@ def label_sample(sample, limit):
     if todo.empty:
         return
 
-    if not LLAMA_SERVER.exists():
-        raise SystemExit(f"llama-server was not found at {LLAMA_SERVER}. Unpack the llama.cpp release {LLAMA_BUILD} "
-                         "(Windows, CUDA 12.4, with the cudart files) into that folder.")
-    model_path = MODEL_DIR / MODEL_FILE
-    if not model_path.exists():
-        from huggingface_hub import hf_hub_download
-        hf_hub_download(MODEL_REPO, MODEL_FILE, local_dir=MODEL_DIR)
+    ensure_llama_server()
+    model_path = ensure_model()
 
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)  # Windows does not go to sleep during the run
     rows, n_done, start = [], 0, time.perf_counter()
